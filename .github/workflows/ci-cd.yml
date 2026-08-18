@@ -80,6 +80,8 @@ jobs:
 
       - name: Build
         working-directory: grubify-frontend
+        env:
+          CI: false
         run: npm run build
 
   dependency-review:
