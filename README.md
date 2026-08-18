@@ -109,3 +109,9 @@ Now you have:
 5. **Simulate memory leak** using the deployed application endpoints
 6. **Create incident in Service Now** to trigger SRE agent response
 
+## Support diagnostics
+
+The `/api/support/ping` and `/api/support/logs` endpoints are disabled until explicitly
+configured. Set a secret `Support__ApiKey` and the `Support__AllowedPingHosts__*` and
+`Support__AllowedLogFiles__*` allowlists in the API container environment. Requests must
+include the configured value in the `X-Support-Api-Key` header.
