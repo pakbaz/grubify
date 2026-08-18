@@ -1,0 +1,200 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions: {}
+
+env:
+  DOTNET_VERSION: 6.0.x
+  NODE_VERSION: 22.x
+
+jobs:
+  backend:
+    name: Build and test API
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore
+        run: dotnet restore Grubify.sln
+
+      - name: Build
+        run: dotnet build Grubify.sln --configuration Release --no-restore
+
+      - name: Test
+        run: >
+          dotnet test Grubify.sln --configuration Release --no-build
+          --logger "trx;LogFileName=tests.trx" --results-directory TestResults
+
+      - name: Upload test results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-test-results
+          path: TestResults/**/*.trx
+          if-no-files-found: warn
+
+  frontend:
+    name: Build frontend
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: grubify-frontend/node_modules
+          key: ${{ runner.os }}-node-${{ env.NODE_VERSION }}-${{ hashFiles('grubify-frontend/package-lock.json') }}
+
+      - name: Install dependencies
+        working-directory: grubify-frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: grubify-frontend
+        env:
+          CI: false
+        run: npm run build
+
+  dependency-review:
+    name: Dependency review
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Review dependencies
+        uses: actions/dependency-review-action@v4
+        with:
+          comment-summary-in-pr: never
+
+  api-container:
+    name: Build API container
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.image.outputs.uri }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set image tag
+        id: image
+        shell: bash
+        env:
+          REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY_ENDPOINT }}
+        run: |
+          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            if [[ -z "${REGISTRY}" ]]; then
+              echo "::error::Set the AZURE_CONTAINER_REGISTRY_ENDPOINT repository variable."
+              exit 1
+            fi
+            echo "uri=${REGISTRY}/grubify-api:${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "uri=grubify-api:ci-${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Authenticate to Azure
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to Azure Container Registry
+        if: ${{ github.ref == 'refs/heads/main' }}
+        env:
+          REGISTRY: ${{ vars.AZURE_CONTAINER_REGISTRY_ENDPOINT }}
+        run: az acr login --name "${REGISTRY%%.*}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and optionally push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: GrubifyApi
+          file: GrubifyApi/Dockerfile
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.image.outputs.uri }}
+
+  deploy-staging:
+    name: Deploy API to staging
+    needs: api-container
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    environment:
+      name: staging
+      url: ${{ steps.deploy.outputs.url }}
+
+    steps:
+      - name: Authenticate to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy API image
+        id: deploy
+        shell: bash
+        env:
+          CONTAINER_APP: ${{ vars.AZURE_API_CONTAINER_APP_NAME }}
+          IMAGE: ${{ needs.api-container.outputs.image }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          for value in CONTAINER_APP RESOURCE_GROUP; do
+            if [[ -z "${!value}" ]]; then
+              echo "::error::Set the ${value} staging environment variable."
+              exit 1
+            fi
+          done
+
+          az containerapp update \
+            --name "${CONTAINER_APP}" \
+            --resource-group "${RESOURCE_GROUP}" \
+            --image "${IMAGE}"
+
+          fqdn="$(az containerapp show \
+            --name "${CONTAINER_APP}" \
+            --resource-group "${RESOURCE_GROUP}" \
+            --query 'properties.configuration.ingress.fqdn' \
+            --output tsv)"
+          echo "url=https://${fqdn}" >> "${GITHUB_OUTPUT}"
